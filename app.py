@@ -4,17 +4,23 @@ from datetime import datetime, date
 from sqlalchemy import func
 import subprocess
 import os
-
+import time
+from contextlib import contextmanager
+from sqlalchemy.exc import OperationalError
 
 import oracledb
 
-
 app = Flask(__name__)
 
+# Updated database configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///expenses.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 3600,
+    'connect_args': {'check_same_thread': False}  # This is key for SQLite
+}
 app.config['SECRET_KEY'] = 'my-secret-key'
-
 
 db = SQLAlchemy(app)
 
@@ -40,7 +46,6 @@ class Saving(db.Model):
     type = db.Column(db.String(50), nullable=False)  # 'deposit' or 'withdrawal'
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-
 # Default categories
 DEFAULT_CATEGORIES = ["Food", "Transport", "Utilities", "Entertainment", "Other"]
 
@@ -52,10 +57,36 @@ def init_db():
             if not CategoryBudget.query.filter_by(name=category_name).first():
                 category = CategoryBudget(name=category_name, budget_amount=1000.00)
                 db.session.add(category)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            print(f"Error initializing database: {e}")
 
 # Initialize database
 init_db()
+
+# Enable WAL mode for better concurrency
+with app.app_context():
+    try:
+        with db.engine.connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            print("WAL mode enabled for better concurrency")
+    except Exception as e:
+        print(f"Note: Could not enable WAL mode: {e}")
+
+def db_operation_with_retry(operation, max_retries=3):
+    """Execute a database operation with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            return operation()
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                time.sleep(0.1 * (2 ** attempt))  # Exponential backoff
+                continue
+            else:
+                raise
 
 def parse_date_or_none(s: str):
     if not s:
@@ -197,7 +228,6 @@ def index():
         day_values=day_values
     )
 
-
 @app.route("/add-saving", methods=["POST"])
 def add_saving():
     description = (request.form.get("description") or "").strip()
@@ -230,8 +260,8 @@ def add_saving():
         flash("Invalid date format. Using today's date.", "warning")
         saving_date = datetime.today()
     
-    # Create and save saving
-    try:
+    # Create and save saving with retry logic
+    def save_operation():
         saving = Saving(
             description=description, 
             amount=amount, 
@@ -240,6 +270,10 @@ def add_saving():
         )
         db.session.add(saving)
         db.session.commit()
+        return True
+    
+    try:
+        db_operation_with_retry(save_operation)
         flash(f"Savings {saving_type} added successfully", "success")
     except Exception as e:
         db.session.rollback()
@@ -250,15 +284,19 @@ def add_saving():
 @app.route("/delete-saving/<int:saving_id>", methods=["POST"])
 def delete_saving(saving_id):
     saving = Saving.query.get_or_404(saving_id)
-    try:
+    
+    def delete_operation():
         db.session.delete(saving)
         db.session.commit()
+        return True
+    
+    try:
+        db_operation_with_retry(delete_operation)
         flash("Savings record deleted successfully", "success")
     except Exception as e:
         db.session.rollback()
         flash(f"Error deleting savings record: {str(e)}", "error")
     return redirect(url_for("index"))
-
 
 @app.route("/add-category", methods=["POST"])
 def add_category():
@@ -283,18 +321,30 @@ def add_category():
     if existing_category:
         # Reactivate if exists but inactive
         if not existing_category.is_active:
-            existing_category.is_active = True
-            existing_category.budget_amount = budget_amount
-            db.session.commit()
-            flash(f"Category '{name}' reactivated with budget ${budget_amount:.2f}", "success")
+            def reactivate_operation():
+                existing_category.is_active = True
+                existing_category.budget_amount = budget_amount
+                db.session.commit()
+                return True
+            
+            try:
+                db_operation_with_retry(reactivate_operation)
+                flash(f"Category '{name}' reactivated with budget ${budget_amount:.2f}", "success")
+            except Exception as e:
+                db.session.rollback()
+                flash(f"Error reactivating category: {str(e)}", "error")
         else:
             flash(f"Category '{name}' already exists!", "error")
         return redirect(url_for("index"))
     
-    try:
+    def add_operation():
         category = CategoryBudget(name=name, budget_amount=budget_amount)
         db.session.add(category)
         db.session.commit()
+        return True
+    
+    try:
+        db_operation_with_retry(add_operation)
         flash(f"Category '{name}' added successfully with budget ${budget_amount:.2f}", "success")
     except Exception as e:
         db.session.rollback()
@@ -316,9 +366,13 @@ def edit_category(category_id):
         flash("Invalid budget amount.", "error")
         return redirect(url_for("index"))
     
-    try:
+    def update_operation():
         category.budget_amount = budget_amount
         db.session.commit()
+        return True
+    
+    try:
+        db_operation_with_retry(update_operation)
         flash(f"Category '{category.name}' budget updated to ${budget_amount:.2f}", "success")
     except Exception as e:
         db.session.rollback()
@@ -334,16 +388,21 @@ def delete_category(category_id):
     # Check if category has expenses
     has_expenses = Expense.query.filter_by(category=category_name).first() is not None
     
-    try:
+    def delete_operation():
         if has_expenses:
             # Instead of deleting, deactivate the category
             category.is_active = False
-            flash(f"Category '{category_name}' deactivated (has existing expenses)", "warning")
         else:
             db.session.delete(category)
-            flash(f"Category '{category_name}' deleted successfully", "success")
-        
         db.session.commit()
+        return True
+    
+    try:
+        db_operation_with_retry(delete_operation)
+        if has_expenses:
+            flash(f"Category '{category_name}' deactivated (has existing expenses)", "warning")
+        else:
+            flash(f"Category '{category_name}' deleted successfully", "success")
     except Exception as e:
         db.session.rollback()
         flash(f"Error deleting category: {str(e)}", "error")
@@ -382,8 +441,8 @@ def add():
         flash("Invalid date format. Using today's date.", "warning")
         expense_date = datetime.today()
     
-    # Create and save expense
-    try:
+    # Create and save expense with retry logic
+    def add_operation():
         e = Expense(
             description=description, 
             amount=amount, 
@@ -392,6 +451,10 @@ def add():
         )
         db.session.add(e)
         db.session.commit()
+        return True
+    
+    try:
+        db_operation_with_retry(add_operation)
         flash("Expense added successfully", "success")
     except Exception as e:
         db.session.rollback()
@@ -402,27 +465,30 @@ def add():
 @app.route("/delete/<int:expense_id>", methods=["POST"])
 def delete(expense_id):
     expense = Expense.query.get_or_404(expense_id)
-    try:
+    
+    def delete_operation():
         db.session.delete(expense)
         db.session.commit()
+        return True
+    
+    try:
+        db_operation_with_retry(delete_operation)
         flash("Expense deleted successfully", "success")
     except Exception as e:
         db.session.rollback()
         flash(f"Error deleting expense: {str(e)}", "error")
     return redirect(url_for("index"))
 
-
-
 @app.route("/sync-to-oracle", methods=["POST"])
 def sync_to_oracle():
-    """Call sync function directly instead of using subprocess"""
+    """Call sync function directly"""
     print("🔄 SYNC BUTTON CLICKED - Starting direct sync...")
     
     try:
-        # Import and call the sync function directly
-        import sync_to_oracle
+        # Import and call the sync function
+        from sync_to_oracle import sync_data
         
-        result = sync_to_oracle.sync_data()
+        result = sync_data()
         print(f"✅ Sync result: {result}")
         
         if "❌" in result or "error" in result.lower() or "failed" in result.lower():
@@ -430,16 +496,12 @@ def sync_to_oracle():
         else:
             flash(f"✅ {result}", "success")
             
-    except ImportError as e:
-        error_msg = f"Could not import sync module: {str(e)}"
-        print(f"❌ {error_msg}")
-        flash(f"❌ {error_msg}", "error")
     except Exception as e:
-        error_msg = f"Sync error: {str(e)}"
+        error_msg = f"❌ Sync error: {str(e)}"
         print(f"❌ {error_msg}")
         flash(f"❌ {error_msg}", "error")
     
     return redirect(url_for("index"))
 
 if __name__ == "__main__":
-    app.run(debug=True, port=4848)
+    app.run(debug=True, port=4848, threaded=True)
